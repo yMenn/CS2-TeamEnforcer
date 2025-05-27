@@ -1,0 +1,108 @@
+name: Build, Package, and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_description:
+        description: 'Description of this build'
+        required: true
+        default: 'New release'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x' # Adjust this to your project's .NET version
+
+      - name: Get latest release
+        id: get_latest_release
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            try {
+              const release = await github.rest.repos.getLatestRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              return release.data.tag_name;
+            } catch (error) {
+              if (error.status === 404) {
+                return 'v0.0.0';
+              }
+              throw error;
+            }
+          result-encoding: string
+
+      - name: Determine new version
+        id: new_version
+        run: |
+          latest_version="${{ steps.get_latest_release.outputs.result }}"
+          if [ "$latest_version" = "v0.0.0" ]; then
+            new_version="v1.0.0"
+          else
+            new_version=$(echo $latest_version | awk -F. -v OFS=. '{$NF += 1 ; print}')
+          fi
+          echo "NEW_VERSION=$new_version" >> $GITHUB_OUTPUT
+
+      - name: Build project
+        run: dotnet build --configuration Release
+
+      - name: Publish project
+        run: dotnet publish TeamEnforcer.csproj --configuration Release --output ./publish
+
+      - name: Create release package
+        run: |
+          cd publish
+          mkdir -p TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}/addons/counterstrikesharp/plugins/TeamEnforcer
+          cp -r TeamEnforcer.dll TeamEnforcer.pdb TeamEnforcer.deps.json MySqlConnector.dll TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}/addons/counterstrikesharp/plugins/TeamEnforcer
+          cp -r ../lang TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}/addons/counterstrikesharp/plugins/TeamEnforcer
+          zip -r TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}.zip TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.new_version.outputs.NEW_VERSION }}
+          release_name: Release ${{ steps.new_version.outputs.NEW_VERSION }}
+          body: ${{ github.event.inputs.build_description }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./publish/TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}.zip
+          asset_name: TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}.zip
+          asset_content_type: application/zip
+
+      - name: Generate Attestation
+        id: generate-attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: './publish/TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}.zip'
+
+      - name: Upload Attestation
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ steps.generate-attestation.outputs.bundle-path }}
+          asset_name: TeamEnforcer-${{ steps.new_version.outputs.NEW_VERSION }}-attestation.jsonl
+          asset_content_type: application/json
